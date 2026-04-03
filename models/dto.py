@@ -56,6 +56,8 @@ class BacktestConfig(BaseModel):
     position_size_pct: float = Field(default=1.0, ge=0.01, le=1.0)
     commission_pct:    float = Field(default=0.001, ge=0.0)
     slippage_pct:      float = Field(default=0.0005, ge=0.0)
+    take_profit_pct:   float = Field(default=0.0, ge=0.0, description="익절 비율 (0 = 비활성, 0.1 = 10%)")
+    stop_loss_pct:     float = Field(default=0.0, ge=0.0, description="손절 비율 (0 = 비활성, 0.05 = 5%)")
 
 
 class BacktestRequest(BaseModel):

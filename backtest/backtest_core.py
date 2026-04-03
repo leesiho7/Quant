@@ -67,7 +67,7 @@ class BacktestCore:
             # STEP 1: 청산 판단
             if position is not None:
                 should_exit, exit_type = self._check_exit(
-                    position, signal, close, lr_center, is_last
+                    position, signal, close, lr_center, is_last, config
                 )
                 if should_exit:
                     log_entry, net_proceeds = self._close_position(
@@ -121,15 +121,31 @@ class BacktestCore:
         return pos, capital - invest
 
     @staticmethod
-    def _check_exit(pos, signal, close, lr_center, is_last):
+    def _check_exit(pos, signal, close, lr_center, is_last, config):
         if is_last:
             return True, ("SELL_FORCED" if pos.position_type == "LONG" else "SHORT_COVER_FORCED")
+
+        tp = config.take_profit_pct
+        sl = config.stop_loss_pct
+
         if pos.position_type == "LONG":
+            # 익절 / 손절
+            if tp > 0 and close >= pos.entry_price * (1.0 + tp):
+                return True, "TAKE_PROFIT"
+            if sl > 0 and close <= pos.entry_price * (1.0 - sl):
+                return True, "STOP_LOSS"
+            # 신호 청산
             if signal in (-1, 2):
                 return True, "SELL"
             if not math.isnan(lr_center) and close >= lr_center:
                 return True, "SELL"
         elif pos.position_type == "SHORT":
+            # 익절 / 손절 (숏: 가격이 내려가면 수익)
+            if tp > 0 and close <= pos.entry_price * (1.0 - tp):
+                return True, "TAKE_PROFIT"
+            if sl > 0 and close >= pos.entry_price * (1.0 + sl):
+                return True, "STOP_LOSS"
+            # 신호 청산
             if signal in (1, -2):
                 return True, "SHORT_COVER"
             if not math.isnan(lr_center) and close <= lr_center:
