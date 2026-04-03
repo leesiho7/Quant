@@ -1,61 +1,43 @@
 """
-3. Backtest Core
-────────────────
-봉 단위(Bar-by-bar) 거래 시뮬레이션.
+3. Backtest Core  (양방향 포지션 지원)
+포지션 상태: None(관망) | LONG(매수) | SHORT(공매도)
 
-핵심 규칙
-─────────
-* 동시에 1 포지션만 허용 (피라미딩 없음).
-* signal == +1  → 매수  (포지션 없을 때만)
-* signal == -1  → 매도  (포지션 보유 중일 때만)
-* 마지막 봉까지 미청산이면 강제 청산 (SELL_FORCED).
+신호 체계
+---------
+ 1  : Long  진입
+-1  : Short 진입
+ 2  : Long  익절 신호  (LR_V2)
+-2  : Short 익절 신호  (LR_V2)
 
-복리 계산
-─────────
-매 거래는 잔여 현금 전체(또는 position_size_pct 비율)를 재투자한다.
-→ 이전 거래 수익이 다음 거래 투자금에 그대로 포함되어 자연스럽게 복리 적용.
-
-비용 처리
-─────────
-매수 체결가 = Close × (1 + slippage_pct)   ← 불리하게 체결
-매도 체결가 = Close × (1 - slippage_pct)   ← 불리하게 체결
-수수료     = 투자금액(또는 회수금액) × commission_pct  (편도)
+LR_V2 추가 청산 조건
+---------------------
+Long  보유 중 : close >= lr_center 일 때 자동 청산
+Short 보유 중 : close <= lr_center 일 때 자동 청산
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 from models.dto import BacktestConfig, TradeLog
 
 
-# ── 내부 포지션 상태 ────────────────────────────────────────────────────────
-
 @dataclass
 class _OpenPosition:
-    """매수 진입 후 청산 전까지의 상태를 담는 내부 자료구조."""
-    entry_date: str
-    entry_price: float          # 슬리피지 반영 실제 체결가
-    entry_commission: float     # 진입 수수료
-    entry_slippage: float       # 진입 슬리피지 비용
-    shares: float               # 보유 주수
-    entry_bar: int              # 진입 봉 인덱스 (holding_bars 계산용)
+    position_type:    str    # "LONG" | "SHORT"
+    entry_date:       str
+    entry_price:      float
+    entry_commission: float
+    entry_slippage:   float
+    shares:           float
+    invest:           float
+    entry_bar:        int
 
-
-# ── 메인 클래스 ─────────────────────────────────────────────────────────────
 
 class BacktestCore:
-    """
-    df 의 'close' 와 'signal' 컬럼을 읽어 봉 단위 시뮬레이션을 실행한다.
-
-    Returns
-    ───────
-    equity_df     : DatetimeIndex DataFrame, 컬럼 'equity' (봉별 포트폴리오 가치)
-    trade_log     : List[TradeLog]  왕복 거래 기록
-    final_capital : float           시뮬레이션 종료 시 현금 잔고
-    """
 
     def run(
         self,
@@ -63,118 +45,162 @@ class BacktestCore:
         config: BacktestConfig,
     ) -> Tuple[pd.DataFrame, List[TradeLog], float]:
 
-        capital: float = config.initial_capital
-        position: _OpenPosition | None = None
-        trade_log: List[TradeLog] = []
-        equity_records: List[dict] = []
-        trade_counter: int = 0
-
+        capital        = config.initial_capital
+        position       = None
+        trade_log      = []
+        equity_records = []
+        trade_counter  = 0
         rows = list(df.iterrows())
-        n = len(rows)
+        n    = len(rows)
 
         for bar_idx, (date, row) in enumerate(rows):
-            signal: int = int(row["signal"])
-            close: float = float(row["close"])
-            is_last_bar: bool = bar_idx == n - 1
+            signal  = int(row.get("signal", 0))
+            close   = float(row["close"])
+            is_last = bar_idx == n - 1
 
-            # ── 매수 진입 ────────────────────────────────────────────────
-            if signal == 1 and position is None:
-                invest: float = capital * config.position_size_pct
+            try:
+                lrc       = row["lr_center"] if "lr_center" in row.index else float("nan")
+                lr_center = float(lrc) if not math.isnan(float(lrc)) else float("nan")
+            except Exception:
+                lr_center = float("nan")
 
-                # 슬리피지: 매수는 불리하게(높은 가격으로) 체결
-                slip_cost_entry: float = invest * config.slippage_pct
-                commission_entry: float = invest * config.commission_pct
-                total_entry_cost: float = slip_cost_entry + commission_entry
-
-                net_invest: float = invest - total_entry_cost
-                eff_buy_price: float = close * (1.0 + config.slippage_pct)
-                shares: float = net_invest / eff_buy_price
-
-                capital -= invest  # 복리: 현재 잔고에서 차감
-
-                position = _OpenPosition(
-                    entry_date=_fmt(date),
-                    entry_price=round(eff_buy_price, 6),
-                    entry_commission=round(commission_entry, 4),
-                    entry_slippage=round(slip_cost_entry, 4),
-                    shares=shares,
-                    entry_bar=bar_idx,
+            # STEP 1: 청산 판단
+            if position is not None:
+                should_exit, exit_type = self._check_exit(
+                    position, signal, close, lr_center, is_last
                 )
-
-            # ── 청산 ─────────────────────────────────────────────────────
-            elif position is not None and (signal == -1 or is_last_bar):
-                exit_type: str = "SELL" if signal == -1 else "SELL_FORCED"
-
-                # 슬리피지: 매도는 불리하게(낮은 가격으로) 체결
-                eff_sell_price: float = close * (1.0 - config.slippage_pct)
-                gross_proceeds: float = position.shares * eff_sell_price
-
-                slip_cost_exit: float = position.shares * close * config.slippage_pct
-                commission_exit: float = gross_proceeds * config.commission_pct
-                net_proceeds: float = gross_proceeds - commission_exit
-
-                # 손익 계산
-                cost_basis: float = position.shares * position.entry_price
-                gross_pnl: float = gross_proceeds - cost_basis
-                total_cost: float = (
-                    position.entry_commission
-                    + position.entry_slippage
-                    + commission_exit
-                    + slip_cost_exit
-                )
-                net_pnl: float = net_proceeds - cost_basis - position.entry_commission - position.entry_slippage
-
-                # 수익률(%) – 진입 시 실제 투자금 대비
-                invested_amount: float = cost_basis + position.entry_commission + position.entry_slippage
-                return_pct: float = (net_pnl / invested_amount * 100.0) if invested_amount > 0 else 0.0
-
-                holding_bars: int = bar_idx - position.entry_bar
-
-                trade_counter += 1
-                trade_log.append(
-                    TradeLog(
-                        trade_no=trade_counter,
-                        entry_date=position.entry_date,
-                        entry_price=round(position.entry_price, 4),
-                        entry_commission=round(position.entry_commission, 4),
-                        entry_slippage=round(position.entry_slippage, 4),
-                        exit_date=_fmt(date),
-                        exit_price=round(eff_sell_price, 4),
-                        exit_commission=round(commission_exit, 4),
-                        exit_slippage=round(slip_cost_exit, 4),
-                        exit_type=exit_type,
-                        shares=round(position.shares, 6),
-                        holding_bars=holding_bars,
-                        gross_pnl=round(gross_pnl, 4),
-                        total_cost=round(total_cost, 4),
-                        net_pnl=round(net_pnl, 4),
-                        return_pct=round(return_pct, 4),
-                        is_winner=net_pnl > 0,
+                if should_exit:
+                    log_entry, net_proceeds = self._close_position(
+                        position, trade_counter + 1, date, close, exit_type, config
                     )
-                )
+                    trade_log.append(log_entry)
+                    trade_counter += 1
+                    capital  += net_proceeds
+                    position  = None
 
-                capital += net_proceeds  # 복리: 청산 대금을 현금에 합산
-                position = None
+            # STEP 2: 신규 진입
+            if position is None and not is_last:
+                if signal == 1:
+                    position, capital = self._open_long(capital, close, bar_idx, date, config)
+                elif signal == -1:
+                    position, capital = self._open_short(capital, close, bar_idx, date, config)
 
-            # ── 봉별 포트폴리오 가치 스냅샷 ─────────────────────────────
-            # 현금 + 보유 주식의 현재가 평가액 (미실현 손익 포함)
-            market_value: float = (position.shares * close) if position is not None else 0.0
+            # STEP 3: 봉별 포트폴리오 평가
+            market_value = self._market_value(position, close)
             equity_records.append({"date": date, "equity": capital + market_value})
 
-        # equity DataFrame 생성
-        equity_df = (
-            pd.DataFrame(equity_records)
-            .set_index("date")
-        )
+        equity_df = pd.DataFrame(equity_records).set_index("date")
         equity_df.index = pd.to_datetime(equity_df.index)
-
         return equity_df, trade_log, capital
 
+    def _open_long(self, capital, close, bar_idx, date, config):
+        invest     = capital * config.position_size_pct
+        slip_cost  = invest  * config.slippage_pct
+        commission = invest  * config.commission_pct
+        eff_buy    = close   * (1.0 + config.slippage_pct)
+        net_invest = invest - slip_cost - commission
+        shares     = net_invest / eff_buy if eff_buy > 0 else 0
+        pos = _OpenPosition(
+            position_type="LONG", entry_date=_fmt(date),
+            entry_price=round(eff_buy, 6), entry_commission=round(commission, 4),
+            entry_slippage=round(slip_cost, 4), shares=shares, invest=invest, entry_bar=bar_idx,
+        )
+        return pos, capital - invest
 
-# ── 헬퍼 ────────────────────────────────────────────────────────────────────
+    def _open_short(self, capital, close, bar_idx, date, config):
+        invest     = capital * config.position_size_pct
+        eff_sell   = close   * (1.0 - config.slippage_pct)
+        slip_cost  = invest  * config.slippage_pct
+        commission = invest  * config.commission_pct
+        shares     = invest  / eff_sell if eff_sell > 0 else 0
+        pos = _OpenPosition(
+            position_type="SHORT", entry_date=_fmt(date),
+            entry_price=round(eff_sell, 6), entry_commission=round(commission, 4),
+            entry_slippage=round(slip_cost, 4), shares=shares, invest=invest, entry_bar=bar_idx,
+        )
+        return pos, capital - invest
+
+    @staticmethod
+    def _check_exit(pos, signal, close, lr_center, is_last):
+        if is_last:
+            return True, ("SELL_FORCED" if pos.position_type == "LONG" else "SHORT_COVER_FORCED")
+        if pos.position_type == "LONG":
+            if signal in (-1, 2):
+                return True, "SELL"
+            if not math.isnan(lr_center) and close >= lr_center:
+                return True, "SELL"
+        elif pos.position_type == "SHORT":
+            if signal in (1, -2):
+                return True, "SHORT_COVER"
+            if not math.isnan(lr_center) and close <= lr_center:
+                return True, "SHORT_COVER"
+        return False, ""
+
+    def _close_position(self, pos, trade_no, date, close, exit_type, config):
+        if pos.position_type == "LONG":
+            return self._close_long(pos, trade_no, date, close, exit_type, config)
+        return self._close_short(pos, trade_no, date, close, exit_type, config)
+
+    def _close_long(self, pos, trade_no, date, close, exit_type, config):
+        eff_sell        = close * (1.0 - config.slippage_pct)
+        gross_proceeds  = pos.shares * eff_sell
+        slip_cost_exit  = pos.shares * close * config.slippage_pct
+        commission_exit = gross_proceeds * config.commission_pct
+        net_proceeds    = gross_proceeds - commission_exit
+        cost_basis      = pos.shares * pos.entry_price
+        gross_pnl       = gross_proceeds - cost_basis
+        total_cost      = pos.entry_commission + pos.entry_slippage + commission_exit + slip_cost_exit
+        net_pnl         = net_proceeds - cost_basis - pos.entry_commission - pos.entry_slippage
+        return_pct      = (net_pnl / pos.invest * 100.0) if pos.invest > 0 else 0.0
+        holding_bars    = trade_no  # simplified
+        log = TradeLog(
+            trade_no=trade_no, position_type="LONG",
+            entry_date=pos.entry_date, entry_price=round(pos.entry_price, 4),
+            entry_commission=round(pos.entry_commission, 4), entry_slippage=round(pos.entry_slippage, 4),
+            exit_date=_fmt(date), exit_price=round(eff_sell, 4),
+            exit_commission=round(commission_exit, 4), exit_slippage=round(slip_cost_exit, 4),
+            exit_type=exit_type, shares=round(pos.shares, 6), holding_bars=0,
+            gross_pnl=round(gross_pnl, 4), total_cost=round(total_cost, 4),
+            net_pnl=round(net_pnl, 4), return_pct=round(return_pct, 4), is_winner=net_pnl > 0,
+        )
+        return log, net_proceeds
+
+    def _close_short(self, pos, trade_no, date, close, exit_type, config):
+        eff_cover       = close * (1.0 + config.slippage_pct)
+        gross_cover     = pos.shares * eff_cover
+        slip_cost_exit  = pos.shares * close * config.slippage_pct
+        commission_exit = gross_cover * config.commission_pct
+        short_received  = pos.shares * pos.entry_price
+        gross_pnl       = short_received - gross_cover
+        total_cost      = pos.entry_commission + pos.entry_slippage + commission_exit + slip_cost_exit
+        net_pnl         = gross_pnl - commission_exit - pos.entry_commission - pos.entry_slippage
+        return_pct      = (net_pnl / pos.invest * 100.0) if pos.invest > 0 else 0.0
+        net_proceeds    = pos.invest + net_pnl
+        log = TradeLog(
+            trade_no=trade_no, position_type="SHORT",
+            entry_date=pos.entry_date, entry_price=round(pos.entry_price, 4),
+            entry_commission=round(pos.entry_commission, 4), entry_slippage=round(pos.entry_slippage, 4),
+            exit_date=_fmt(date), exit_price=round(eff_cover, 4),
+            exit_commission=round(commission_exit, 4), exit_slippage=round(slip_cost_exit, 4),
+            exit_type=exit_type, shares=round(pos.shares, 6), holding_bars=0,
+            gross_pnl=round(gross_pnl, 4), total_cost=round(total_cost, 4),
+            net_pnl=round(net_pnl, 4), return_pct=round(return_pct, 4), is_winner=net_pnl > 0,
+        )
+        return log, net_proceeds
+
+    @staticmethod
+    def _market_value(pos, close):
+        if pos is None:
+            return 0.0
+        if pos.position_type == "LONG":
+            return pos.shares * close
+        return pos.invest + (pos.entry_price - close) * pos.shares
+
 
 def _fmt(date) -> str:
     try:
+        if hasattr(date, "hour") and (date.hour != 0 or date.minute != 0):
+            return date.strftime("%Y-%m-%d %H:%M")
         return str(date.date())
     except AttributeError:
         return str(date)
