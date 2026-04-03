@@ -131,5 +131,10 @@ class BacktestResult(BaseModel):
     equity_curve:   List[float]
     drawdown_curve: List[float]
 
+    # LR Channel V2 밴드 시계열 (프론트 차트용, non-LR_V2 전략일 때 빈 리스트)
+    upper_band: List[Optional[float]] = Field(default_factory=list)
+    lower_band: List[Optional[float]] = Field(default_factory=list)
+    lr_center:  List[Optional[float]] = Field(default_factory=list)
+
     trade_log:  List[TradeLog]
     indicators: IndicatorSnapshot

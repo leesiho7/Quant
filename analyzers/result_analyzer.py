@@ -55,6 +55,11 @@ class ResultAnalyzer:
         # ── 1. 시계열 데이터 생성 ─────────────────────────────────────────
         labels, equity_curve, drawdown_curve = self._build_chart_series(equity)
 
+        # ── 1-b. LR 채널 밴드 추출 ────────────────────────────────────────
+        upper_band = _extract_series(df, "upper_band")
+        lower_band = _extract_series(df, "lower_band")
+        lr_center  = _extract_series(df, "lr_center")
+
         # ── 2. MDD 계산 ───────────────────────────────────────────────────
         dd_series = pd.Series(drawdown_curve, index=equity.index)
         mdd_pct, mdd_start, mdd_end = self._calc_mdd(equity, dd_series)
@@ -106,6 +111,9 @@ class ResultAnalyzer:
             labels=labels,
             equity_curve=equity_curve,
             drawdown_curve=drawdown_curve,
+            upper_band=upper_band,
+            lower_band=lower_band,
+            lr_center=lr_center,
             # 거래 로그
             trade_log=trade_log,
             # 진단
@@ -224,3 +232,17 @@ def _safe_float(val) -> Optional[float]:
         return None if np.isnan(f) else round(f, 4)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_series(df: pd.DataFrame, col: str) -> list:
+    """df 컬럼을 float 리스트로 변환. NaN → None (JSON null)."""
+    if col not in df.columns:
+        return []
+    result = []
+    for v in df[col]:
+        try:
+            f = float(v)
+            result.append(None if np.isnan(f) else round(f, 4))
+        except (TypeError, ValueError):
+            result.append(None)
+    return result
