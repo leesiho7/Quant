@@ -22,7 +22,7 @@ class DataProviderConfig(BaseModel):
     ticker: str = Field(..., example="AAPL", description="Yahoo Finance 티커")
     start_date: str = Field(..., example="2020-01-01", description="YYYY-MM-DD")
     end_date: str = Field(..., example="2024-12-31", description="YYYY-MM-DD")
-    interval: Literal["1d", "1wk", "1mo"] = Field(default="1d", description="봉 단위")
+    interval: Literal["5m", "15m", "60m", "1d"] = Field(default="1d", description="봉 단위 (5m|15m|60m|1d)")
 
 
 class RSIConfig(BaseModel):

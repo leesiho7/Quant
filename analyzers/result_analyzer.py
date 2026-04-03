@@ -209,9 +209,13 @@ class ResultAnalyzer:
 
 def _fmt(date) -> str:
     try:
+        # 분봉/시간봉이면 HH:MM 까지 표시, 일봉이면 날짜만
+        if hasattr(date, 'hour') and (date.hour != 0 or date.minute != 0):
+            return date.strftime("%Y-%m-%d %H:%M")
         return str(date.date())
     except AttributeError:
         return str(date)
+
 
 
 def _safe_float(val) -> Optional[float]:
